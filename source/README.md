@@ -36,7 +36,7 @@ Built with the [Meltano Singer SDK](https://sdk.meltano.com).
 | stream_options               | False    | None       | Options for individual streams                                                   |
 | stream_options.issues        | False    | None       | Options specific to the issues stream                                            |
 | stream_options.issues.jql    | False    | id != null | A JQL query to filter issues                                                     |
-| stream_options.issues.fields | False    | *all       | A comma-separated list of fields to include. All fields are included by default. |
+| stream_options.issues.fields | False    | *all       | A comma-separated list of fields to include. All fields are included by default. This is the public projection for the warehouse; the tap always appends the API-required fields `id`, `created` and `updated` (primary key, replication watermark and child-stream context), so a narrow selection cannot drop them. A page that still omits them fails as a whole. |
 | include_audit_logs           | False    | False      | Include the audit logs stream                                                    |
 
 ### Built-in capabilities

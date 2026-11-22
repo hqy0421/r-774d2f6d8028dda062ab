@@ -6,6 +6,7 @@ import sys
 from typing import TYPE_CHECKING, Any, TypeVar
 
 import requests.auth
+from singer_sdk.exceptions import FatalAPIError
 from singer_sdk.streams import RESTStream
 
 if sys.version_info >= (3, 12):
@@ -27,6 +28,22 @@ _TNextPageToken = TypeVar("_TNextPageToken")
 
 class ResumableAPIError(Exception):
     """Exception raised for resumable API errors."""
+
+    @override
+    def __init__(self, message: str, response: requests.Response) -> None:
+        super().__init__(message)
+        self.response = response
+
+
+class PageWatermarkError(FatalAPIError):
+    """A page is missing fields required to identify the sync watermark.
+
+    Raised at page level (before any record from the page is emitted) when the
+    payload omits the primary key or replication-key fields the tap relies on
+    for incremental state and for parent/child stream context. Failing the page
+    as a whole prevents records from being persisted without a watermark, which
+    would otherwise corrupt bookmark progression.
+    """
 
     @override
     def __init__(self, message: str, response: requests.Response) -> None:

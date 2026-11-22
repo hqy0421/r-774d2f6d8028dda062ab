@@ -12,7 +12,12 @@ from typing import TYPE_CHECKING, Any
 from singer_sdk import typing as th  # JSON Schema typing helpers
 from singer_sdk.pagination import JSONPathPaginator, OffsetPaginator
 
-from tap_jira.client import JiraStartAtPaginatedStream, JiraStream, ResumableAPIError
+from tap_jira.client import (
+    JiraStartAtPaginatedStream,
+    JiraStream,
+    PageWatermarkError,
+    ResumableAPIError,
+)
 
 if sys.version_info >= (3, 12):
     from typing import override
@@ -557,6 +562,23 @@ class IssueStream(JiraStream[str]):
     records_jsonpath = "$[issues][*]"  # Or override `parse_response`.
     next_page_token_jsonpath = "$.nextPageToken"  # noqa: S105
     instance_name = "issues"
+
+    # Fields the tap itself depends on, independently of the user-selected
+    # business-field projection: ``id`` is the primary key and the context key
+    # consumed by every issue child stream (changelog, comments, watchers,
+    # worklogs); ``created``/``updated`` drive incremental replication and are
+    # hoisted to the record's top level in ``post_process``.
+    required_request_fields = ("id", "created", "updated")
+
+    # Fields whose absence makes a record impossible to bookmark or link to
+    # child streams. A page containing a record without one of these fails as a
+    # whole, so no records are persisted without an identifiable watermark.
+    required_watermark_fields = ("id", "created", "updated")
+
+    # Jira ``fields`` selectors that already return every field, so merging the
+    # required fields into them would be meaningless (and turn them into an
+    # explicit list, losing wildcard behavior).
+    _WILDCARD_FIELD_SELECTORS = ("*all", "*navigable")
 
     __content_schema = ArrayType(
         ObjectType(
@@ -1857,11 +1879,7 @@ class IssueStream(JiraStream[str]):
         params: dict[str, Any] = {}
 
         params["maxResults"] = self.config.get("page_size", {}).get("issues", 10)
-        params["fields"] = (
-            self.config.get("stream_options", {})
-            .get("issues", {})
-            .get("fields", "*all")
-        )
+        params["fields"] = self.get_fields_param()
 
         jql: list[str] = []
 
@@ -1889,6 +1907,75 @@ class IssueStream(JiraStream[str]):
         params["jql"] = " and ".join(jql) + f" order by {self.replication_key} asc"
 
         return params
+
+    def get_fields_param(self) -> str:
+        """Build the ``fields`` query parameter for the Jira search request.
+
+        The configured ``stream_options.issues.fields`` value is the public
+        projection selected for the data warehouse. It is distinct from the
+        fields required by the tap itself (primary key, replication keys and
+        child-stream context), which are always merged into the API request so
+        a narrow business-field selection cannot silently drop the watermark.
+
+        Wildcard selectors (``*all``/``*navigable``) already return every
+        field and are passed through unchanged.
+        """
+        configured: str = (
+            self.config.get("stream_options", {})
+            .get("issues", {})
+            .get("fields", "*all")
+        )
+
+        if configured in self._WILDCARD_FIELD_SELECTORS:
+            return configured
+
+        selected: list[str] = [
+            field.strip() for field in configured.split(",") if field.strip()
+        ]
+
+        # Preserve the user's projection order; append only what is missing.
+        for required in self.required_request_fields:
+            if required not in selected:
+                selected.append(required)
+
+        return ",".join(selected)
+
+    @override
+    def parse_response(self, response: requests.Response) -> Iterable[Record]:
+        """Validate a full page before yielding any of its records.
+
+        Every record must carry the primary key and replication-key fields,
+        including ``created``/``updated`` inside the nested ``fields`` object
+        before they are hoisted in :meth:`post_process`. A page that cannot
+        identify its watermark fails as a whole instead of emitting partial
+        records that would corrupt incremental bookmark progression.
+        """
+        records = list(super().parse_response(response))
+
+        for record in records:
+            nested_fields = record.get("fields")
+            if not isinstance(nested_fields, dict):
+                nested_fields = {}
+
+            missing = [
+                field
+                for field in self.required_watermark_fields
+                if record.get(field) is None and nested_fields.get(field) is None
+            ]
+
+            if missing:
+                msg = (
+                    f"Issues page is missing required field(s) "
+                    f"{', '.join(missing)} needed to identify the replication "
+                    "watermark and child-stream context. Check "
+                    "stream_options.issues.fields: required fields are "
+                    f"automatically appended, so this indicates the API did not "
+                    f"return them. Fields parameter sent: "
+                    f"{self.get_fields_param()}"
+                )
+                raise PageWatermarkError(msg, response)
+
+        yield from records
 
     @override
     def post_process(self, row: Record, context: Context | None = None) -> Record:
